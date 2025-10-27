@@ -8,6 +8,10 @@
 (define-constant ERR_INVALID_AGE (err u7))
 (define-constant ERR_EMERGENCY_DISABLED (err u8))
 (define-constant ERR_WITHDRAWAL_DISABLED (err u9))
+(define-constant ERR_INVALID_BENEFICIARY (err u10))
+(define-constant ERR_INVALID_PERCENTAGE (err u11))
+(define-constant ERR_BENEFICIARY_LIMIT_REACHED (err u12))
+(define-constant ERR_NOT_BENEFICIARY (err u13))
 
 (define-data-var minimum-contribution uint u1000000)
 (define-data-var retirement-age uint u65)
@@ -35,6 +39,12 @@
   })
 
 (define-map participant-contribution-count principal uint)
+
+(define-map beneficiaries
+  { participant: principal, beneficiary: principal }
+  { percentage: uint })
+
+(define-map beneficiary-count principal uint)
 
 (define-public (register-participant (participant-age uint))
   (let ((sender tx-sender))
@@ -250,3 +260,70 @@
     contract-enabled: (var-get contract-enabled),
     emergency-enabled: (var-get emergency-enabled)
   })
+
+(define-public (set-beneficiary (beneficiary principal) (percentage uint))
+  (let (
+    (sender tx-sender)
+    (participant-data (unwrap! (map-get? participants sender) ERR_NOT_REGISTERED))
+    (current-count (default-to u0 (map-get? beneficiary-count sender)))
+  )
+    (asserts! (not (is-eq beneficiary sender)) ERR_INVALID_BENEFICIARY)
+    (asserts! (and (> percentage u0) (<= percentage u100)) ERR_INVALID_PERCENTAGE)
+    (asserts! (<= current-count u5) ERR_BENEFICIARY_LIMIT_REACHED)
+    
+    (let ((is-new-beneficiary (is-none (map-get? beneficiaries { participant: sender, beneficiary: beneficiary }))))
+      (map-set beneficiaries 
+        { participant: sender, beneficiary: beneficiary }
+        { percentage: percentage })
+      
+      (if is-new-beneficiary
+        (map-set beneficiary-count sender (+ current-count u1))
+        true)
+      
+      (ok true))))
+
+(define-public (remove-beneficiary (beneficiary principal))
+  (let (
+    (sender tx-sender)
+    (participant-data (unwrap! (map-get? participants sender) ERR_NOT_REGISTERED))
+    (current-count (default-to u0 (map-get? beneficiary-count sender)))
+  )
+    (asserts! (is-some (map-get? beneficiaries { participant: sender, beneficiary: beneficiary })) ERR_NOT_BENEFICIARY)
+    
+    (map-delete beneficiaries { participant: sender, beneficiary: beneficiary })
+    (map-set beneficiary-count sender (- current-count u1))
+    (ok true)))
+
+(define-public (claim-beneficiary-share (participant principal))
+  (let (
+    (sender tx-sender)
+    (participant-data (unwrap! (map-get? participants participant) ERR_NOT_REGISTERED))
+    (beneficiary-data (unwrap! (map-get? beneficiaries { participant: participant, beneficiary: sender }) ERR_NOT_BENEFICIARY))
+    (participant-balance (get balance participant-data))
+    (beneficiary-percentage (get percentage beneficiary-data))
+    (share-amount (/ (* participant-balance beneficiary-percentage) u100))
+  )
+    (asserts! (> share-amount u0) ERR_INSUFFICIENT_BALANCE)
+    
+    (try! (as-contract (stx-transfer? share-amount tx-sender sender)))
+    
+    (map-set participants participant
+      (merge participant-data
+        { balance: (- participant-balance share-amount) }))
+    
+    (ok share-amount)))
+
+(define-read-only (get-beneficiary (participant principal) (beneficiary principal))
+  (map-get? beneficiaries { participant: participant, beneficiary: beneficiary }))
+
+(define-read-only (get-beneficiary-count (participant principal))
+  (default-to u0 (map-get? beneficiary-count participant)))
+
+(define-read-only (calculate-beneficiary-share (participant principal) (beneficiary principal))
+  (match (map-get? participants participant)
+    participant-data
+      (match (map-get? beneficiaries { participant: participant, beneficiary: beneficiary })
+        beneficiary-data
+          (some (/ (* (get balance participant-data) (get percentage beneficiary-data)) u100))
+        none)
+    none))
